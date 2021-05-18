@@ -81,6 +81,14 @@ configurable_parameters = [{'name': 'camera_name',                  'default': '
                            {'name': 'stereo_module.gain.1',         'default': '16', 'description': 'Initial value for hdr_merge filter'},
                            {'name': 'stereo_module.exposure.2',     'default': '1', 'description': 'Initial value for hdr_merge filter'},
                            {'name': 'stereo_module.gain.2',         'default': '16', 'description': 'Initial value for hdr_merge filter'},
+
+                           {'name': 'base_frame_id',                'default': "'camera_link'", 'description': ''},
+
+                           {'name': 'depth_frame_id',               'default': "'camera_depth_frame'", 'description': ''},
+                           {'name': 'color_frame_id',               'default': "'camera_color_frame'", 'description': ''},
+
+                           {'name': 'depth_optical_frame_id',       'default': "'camera_depth_optical_frame'", 'description': ''},
+                           {'name': 'color_optical_frame_id',       'default': "'camera_color_optical_frame'", 'description': ''},
                           ]
 
 def declare_configurable_parameters(parameters):
