@@ -15,6 +15,7 @@ import os
 import time
 import math
 import json
+import argparse
 
 
 def getch():
@@ -29,14 +30,14 @@ def getch():
     return ch
 
 
-def print_status(status):
+def print_status(transforms, mode, message):
     sys.stdout.write(
         "%-8s%-8s%-8s%-40s\r"
         % (
-            status["mode"],
-            status[status["mode"]]["value"],
-            status[status["mode"]]["step"],
-            status["message"],
+            mode,
+            transforms[mode]["value"],
+            transforms[mode]["step"],
+            message,
         )
     )
 
@@ -51,22 +52,22 @@ class CamTransformPublisher(Node):
         self._to_frame = to_frame
         self._broadcaster = tf2_ros.StaticTransformBroadcaster(self)
 
-    def publish_status(self, status):
+    def publish_transforms(self, transforms):
         static_transformStamped = TransformStamped()
         static_transformStamped.header.stamp = self.get_clock().now().to_msg()
         static_transformStamped.header.frame_id = self._from_frame
 
         static_transformStamped.child_frame_id = self._to_frame
-        static_transformStamped.transform.translation.x = status["x"]["value"]
-        static_transformStamped.transform.translation.y = status["y"]["value"]
-        static_transformStamped.transform.translation.z = status["z"]["value"]
+        static_transformStamped.transform.translation.x = transforms["x"]["value"]
+        static_transformStamped.transform.translation.y = transforms["y"]["value"]
+        static_transformStamped.transform.translation.z = transforms["z"]["value"]
 
         quat = R.from_euler(
             "xyz",
             [
-                math.radians(status["roll"]["value"]),
-                math.radians(status["pitch"]["value"]),
-                math.radians(status["azimuth"]["value"]),
+                math.radians(transforms["roll"]["value"]),
+                math.radians(transforms["pitch"]["value"]),
+                math.radians(transforms["azimuth"]["value"]),
             ],
         ).as_quat()
 
@@ -78,42 +79,46 @@ class CamTransformPublisher(Node):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("USAGE:")
-        print("set_cams_transforms.py from_frame to_frame x y z azimuth pitch roll")
-        print("x, y, z: in meters")
-        print("azimuth, pitch, roll: in degrees")
-        print
-        print("If parameters are not given read last used parameters.")
-        print
-        print("[OPTIONS]")
-        print("--file <file name> : if given, default values are loaded from file")
-        sys.exit(-1)
+    parser = argparse.ArgumentParser(description="Publishes tf2 data")
+    parser.add_argument('from_frame', help='reference frame')
+    parser.add_argument('to_frame', help='frame to publish')
+    parser.add_argument('--file', type=str, help='file to save/load transforms data')
+    parser.add_argument('--adjust', action='store_true')
+    parser.add_argument('--transforms', type=float, metavar=("x", "y", "z", "azimuth", "pitch", "roll"), nargs=6, help='initial camera transformation, in meters and degrees')
 
-    from_frame, to_frame = sys.argv[1:3]
-    try:
-        filename = sys.argv[sys.argv.index("--file") + 1]
-        print("Using file %s" % os.path.abspath(filename))
-    except:
-        filename = os.path.join(os.path.dirname(__file__), "_set_cams_info_file.txt")
-        print("Using default file %s" % os.path.abspath(filename))
+    args = parser.parse_args()
 
-    if len(sys.argv) >= 9:
-        x, y, z, yaw, pitch, roll = [float(arg) for arg in sys.argv[3:9]]
-        status = {
-            "mode": "pitch",
-            "x": {"value": x, "key": "a", "step": 0.1},
-            "y": {"value": y, "key": "s", "step": 0.1},
-            "z": {"value": z, "key": "d", "step": 0.1},
-            "azimuth": {"value": yaw, "key": "k", "step": 1},
-            "pitch": {"value": pitch, "key": "l", "step": 1},
-            "roll": {"value": roll, "key": ";", "step": 1},
-            "message": "",
+    from_frame, to_frame = args.from_frame, args.to_frame
+    filename = args.file
+    print("Using file %s" % os.path.abspath(filename))
+
+    keybinds = {
+        "a": "x",
+        "s": "y",
+        "d": "z",
+        "f": "azimuth",
+        "g": "pitch",
+        "h": "roll",
+    }
+
+    mode = "pitch"
+    message = ""
+
+    if args.transforms:
+        x, y, z, yaw, pitch, roll = args.transforms
+        transforms = {
+            "x": {"value": x, "step": 0.1},
+            "y": {"value": y, "step": 0.1},
+            "z": {"value": z, "step": 0.1},
+            "azimuth": {"value": yaw, "step": 1},
+            "pitch": {"value": pitch, "step": 1},
+            "roll": {"value": roll, "step": 1},
         }
         print("Use given initial values.")
-    else:
+    elif filename:
         try:
-            status = json.load(open(filename, "r"))
+            with open(filename) as transforms_file:
+                transforms = json.load(transforms_file)
             print("Read initial values from file.")
         except IOError as e:
             print("Failed reading initial parameters from file %s" % filename)
@@ -126,50 +131,59 @@ if __name__ == "__main__":
 
     publisher = CamTransformPublisher(from_frame, to_frame)
 
-    print
-    print(
-        "Press the following keys to change mode"
-    )
-    print("x: a")
-    print("y: s")
-    print("z: d")
-    print("azimuth: k")
-    print("pitch: l")
-    print("roll: ;")
-    print("For each mode, press j to increase by step and f to decrease")
-    print("Press h to multiply step by 2 or g to divide")
-    print
-    print("Press Q to quit")
-    print
+    if args.adjust:
+        print
+        print(
+            "Press the following keys to change mode"
+        )
+        print("x: a")
+        print("y: s")
+        print("z: d")
+        print("azimuth: f")
+        print("pitch: g")
+        print("roll: h")
+        print("For each mode, press k to increase by step and j to decrease")
+        print("Press K to multiply step by 2 or J to divide")
+        print
+        print("Press Q to quit")
+        print
 
-    mode_keymap = {value["key"]: key for key, value in status.items() if "key" in value}
-    print("%-8s%-8s%-8s%s" % ("Mode", "value", "step", "message"))
-    print_status(status)
-    publisher.publish_status(status)
+        print("%-8s%-8s%-8s%s" % ("Mode", "value", "step", "message"))
+        print_status(transforms, mode, message)
+
+    publisher.publish_transforms(transforms)
+
     while True:
-        kk = getch()
-        status["message"] = ""
+        if args.adjust:
+            kk = getch()
 
-        if kk in mode_keymap:
-            status["mode"] = mode_keymap[kk]
-        else:
-            if kk.upper() == "Q" or (len(kk) and bytes(kk, "utf-8")[0] == 3):
-                sys.stdout.write("\n")
-                exit(0)
-            elif kk == "f":
-                status[status["mode"]]["value"] -= status[status["mode"]]["step"]
-            elif kk == "j":
-                status[status["mode"]]["value"] += status[status["mode"]]["step"]
-            elif kk == "g":
-                status[status["mode"]]["step"] /= 2.0
-            elif kk == "h":
-                status[status["mode"]]["step"] *= 2.0
+            if kk in keybinds:
+                mode = keybinds[kk]
             else:
-                status["message"] = "Invalid key:" + kk
-            # Round value because we run into floating point errors that mess up the output
-            # TODO: See if this is precise enough
-            status[status["mode"]]["value"] = round(status[status["mode"]]["value"], 8)
+                if kk.upper() == "Q" or (len(kk) and bytes(kk, "utf-8")[0] == 3):
+                    sys.stdout.write("\n")
+                    exit(0)
+                elif kk == "j":
+                    transforms[mode]["value"] -= transforms[mode]["step"]
+                elif kk == "k":
+                    transforms[mode]["value"] += transforms[mode]["step"]
+                elif kk == "J":
+                    transforms[mode]["step"] /= 2.0
+                elif kk == "K":
+                    transforms[mode]["step"] *= 2.0
+                else:
+                    message = "Invalid key: " + kk
+                # Round value because we run into floating point errors that mess up the output
+                # TODO: See if this is precise enough
+                transforms[mode]["value"] = round(transforms[mode]["value"], 8)
 
-        print_status(status)
-        publisher.publish_status(status)
-        json.dump(status, open(filename, "w"), indent=4)
+            print_status(transforms, mode, message)
+
+            if filename:
+                with open(filename, "w") as transforms_file:
+                    json.dump(transforms, transforms_file, indent=4)
+
+        publisher.publish_transforms(transforms)
+
+        if not args.adjust:
+            time.sleep(0.05)
