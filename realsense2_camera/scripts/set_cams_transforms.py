@@ -40,26 +40,6 @@ def print_status(status):
         )
     )
 
-
-# class SecondaryStaticTransformBroadcaster:
-#     def __init__(self, node, qos=None):
-#         if qos is None:
-#             qos = QoSProfile(
-#                 depth=1,
-#                 durability=DurabilityPolicy.TRANSIENT_LOCAL,
-#                 history=HistoryPolicy.KEEP_LAST,
-#             )
-#         self.pub_tf = node.create_publisher(TFMessage, "/tf_static_c", qos)
-# 
-#     def sendTransform(self, transform):
-#         if not isinstance(transform, list):
-#             if hasattr(transform, "__iter__"):
-#                 transform = list(transform)
-#             else:
-#                 transform = [transform]
-#         self.pub_tf.publish(TFMessage(transforms=transform))
-
-
 class CamTransformPublisher(Node):
     """Based largely on
     https://docs.ros.org/en/foxy/Tutorials/Writing-A-Simple-Py-Publisher-And-Subscriber.html
