@@ -128,7 +128,7 @@ if __name__ == "__main__":
 
     print
     print(
-        "Press the following keys to change mode: x, y, z, (a)zimuth, (p)itch, (r)oll"
+        "Press the following keys to change mode"
     )
     print("x: a")
     print("y: s")
