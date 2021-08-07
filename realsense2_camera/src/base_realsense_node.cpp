@@ -28,334 +28,7 @@ std::vector<std::string> split(const std::string& s, char delimiter) // Thanks t
    }
    return tokens;
 }
-SyncedImuPublisher::SyncedImuPublisher(rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_publisher, 
-                                       std::size_t waiting_list_size):
-            _publisher(imu_publisher), _pause_mode(false),
-            _waiting_list_size(waiting_list_size)
-            {}
 
-SyncedImuPublisher::~SyncedImuPublisher()
-{
-    PublishPendingMessages();
-}
-
-void SyncedImuPublisher::Publish(sensor_msgs::msg::Imu imu_msg)
-{
-    std::lock_guard<std::mutex> lock_guard(_mutex);
-    if (_pause_mode)
-    {
-        if (_pending_messages.size() >= _waiting_list_size)
-        {
-            throw std::runtime_error("SyncedImuPublisher inner list reached maximum size of " + std::to_string(_pending_messages.size()));
-        }
-        _pending_messages.push(imu_msg);
-    }
-    else
-    {
-        _publisher->publish(imu_msg);
-    }
-    return;
-}
-
-void SyncedImuPublisher::Pause()
-{
-    if (!_is_enabled) return;
-    std::lock_guard<std::mutex> lock_guard(_mutex);
-    _pause_mode = true;
-}
-
-void SyncedImuPublisher::Resume()
-{
-    std::lock_guard<std::mutex> lock_guard(_mutex);
-    PublishPendingMessages();
-    _pause_mode = false;
-}
-
-void SyncedImuPublisher::PublishPendingMessages()
-{
-    while (!_pending_messages.empty())
-    {
-        const sensor_msgs::msg::Imu &imu_msg = _pending_messages.front();
-        _publisher->publish(imu_msg);
-        _pending_messages.pop();
-    }
-}
-size_t SyncedImuPublisher::getNumSubscribers()
-{ 
-    if (!_publisher) return 0;
-    return _publisher->get_subscription_count();
-}
-
-static const rmw_qos_profile_t rmw_qos_profile_latched =
-{
-    RMW_QOS_POLICY_HISTORY_KEEP_LAST,
-    1,
-    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
-    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL,
-    RMW_QOS_DEADLINE_DEFAULT,
-    RMW_QOS_LIFESPAN_DEFAULT,
-    RMW_QOS_POLICY_LIVELINESS_SYSTEM_DEFAULT,
-    RMW_QOS_LIVELINESS_LEASE_DURATION_DEFAULT,
-    false
-};
-
-BaseRealSenseNode::BaseRealSenseNode(rclcpp::Node& node,
-                                    rs2::device dev, std::shared_ptr<Parameters> parameters) :
-    _is_running(true),
-    _base_frame_id(""),
-    _node(node),
-    _logger(rclcpp::get_logger("RealSenseCameraNode")),
-    _dev(dev),
-    _json_file_path(""),
-    _static_tf_broadcaster(node),
-    _dynamic_tf_broadcaster(node),
-    _is_initialized_time_base(false),
-    _parameters(parameters)
-{
-    // Types for depth stream
-    _format[RS2_STREAM_DEPTH] = RS2_FORMAT_Z16;    
-    _image_format[RS2_STREAM_DEPTH] = CV_16UC1;    // CVBridge type
-    _encoding[RS2_STREAM_DEPTH] = sensor_msgs::image_encodings::TYPE_16UC1; // ROS message type
-    _unit_step_size[RS2_STREAM_DEPTH] = sizeof(uint16_t); // sensor_msgs::ImagePtr row step size
-    _stream_name[RS2_STREAM_DEPTH] = "depth";
-
-    // Types for confidence stream
-    _image_format[RS2_STREAM_CONFIDENCE] = CV_8UC1;    // CVBridge type
-    _encoding[RS2_STREAM_CONFIDENCE] = sensor_msgs::image_encodings::MONO8; // ROS message type
-    _unit_step_size[RS2_STREAM_CONFIDENCE] = sizeof(uint8_t); // sensor_msgs::ImagePtr row step size
-    _stream_name[RS2_STREAM_CONFIDENCE] = "confidence";
-
-    // Infrared stream
-    _format[RS2_STREAM_INFRARED] = RS2_FORMAT_Y8;
-
-    _image_format[RS2_STREAM_INFRARED] = CV_8UC1;    // CVBridge type
-    _encoding[RS2_STREAM_INFRARED] = sensor_msgs::image_encodings::MONO8; // ROS message type
-    _unit_step_size[RS2_STREAM_INFRARED] = sizeof(uint8_t); // sensor_msgs::ImagePtr row step size
-    _stream_name[RS2_STREAM_INFRARED] = "infra";
-
-    // Types for color stream
-    _image_format[RS2_STREAM_COLOR] = CV_8UC3;    // CVBridge type
-    _encoding[RS2_STREAM_COLOR] = sensor_msgs::image_encodings::RGB8; // ROS message type
-    _unit_step_size[RS2_STREAM_COLOR] = 3; // sensor_msgs::ImagePtr row step size
-    _stream_name[RS2_STREAM_COLOR] = "color";
-    _depth_aligned_encoding[RS2_STREAM_COLOR] = sensor_msgs::image_encodings::TYPE_16UC1;
-
-    // Types for fisheye stream
-    _image_format[RS2_STREAM_FISHEYE] = CV_8UC1;    // CVBridge type
-    _encoding[RS2_STREAM_FISHEYE] = sensor_msgs::image_encodings::MONO8; // ROS message type
-    _unit_step_size[RS2_STREAM_FISHEYE] = sizeof(uint8_t); // sensor_msgs::ImagePtr row step size
-    _stream_name[RS2_STREAM_FISHEYE] = "fisheye";
-
-    // Types for Motion-Module streams
-    _stream_name[RS2_STREAM_GYRO] = "gyro";
-
-    _stream_name[RS2_STREAM_ACCEL] = "accel";
-
-    _stream_name[RS2_STREAM_POSE] = "pose";
-
-    _monitor_options = {RS2_OPTION_ASIC_TEMPERATURE, RS2_OPTION_PROJECTOR_TEMPERATURE};
-
-    try
-    {
-        publishTopics();
-        _toggle_sensors_srv = _node.create_service<std_srvs::srv::SetBool>(
-              "enable",
-              std::bind(
-                &BaseRealSenseNode::toggle_sensor_callback,
-                this,
-                std::placeholders::_1,
-                std::placeholders::_2));
-    }
-    catch(const std::exception& e)
-    {
-        std::cerr << e.what() << '\n';
-        clean();
-        throw;
-    }
-    
-}
-
-void BaseRealSenseNode::clean()
-{
-    // Kill dynamic transform thread
-    _is_running = false;
-    _cv_tf.notify_one();
-    if (_tf_t && _tf_t->joinable())
-        _tf_t->join();
-    if (_update_functions_t && _update_functions_t->joinable())
-        _update_functions_t->join();
-
-    std::set<std::string> module_names;
-    for (const std::pair<stream_index_pair, std::vector<rs2::stream_profile>>& profile : _enabled_profiles)
-    {
-        std::string module_name = _sensors[profile.first].get_info(RS2_CAMERA_INFO_NAME);
-        std::pair< std::set<std::string>::iterator, bool> res = module_names.insert(module_name);
-        if (res.second)
-        {
-            try
-            {
-                _sensors[profile.first].stop();
-            }
-            catch(const std::exception& e)
-            {
-                ROS_WARN_STREAM("Error while stopping sensor: " << e.what());
-            }
-
-            try
-            {
-                _sensors[profile.first].close();
-            }
-            catch(const std::exception& e)
-            {
-                ROS_WARN_STREAM("Error while closing sensor: " << e.what());
-            }
-        }
-    }
-    _synced_imu_publisher.reset();
-}
-BaseRealSenseNode::~BaseRealSenseNode()
-{
-    clean();
-}
-
-bool BaseRealSenseNode::toggle_sensor_callback(std_srvs::srv::SetBool::Request::SharedPtr req, std_srvs::srv::SetBool::Response::SharedPtr res)
-{
-  if (req->data) {
-    ROS_INFO_STREAM("toggling sensor : ON");
-  }
-  else {
-    ROS_INFO_STREAM("toggling sensor : OFF");
-  }
-  std::string msg;
-  res->success = toggleSensors(req->data, res->message);
-  return true;
-}
-
-bool BaseRealSenseNode::toggleSensors(bool enabled, std::string& msg)
-{
-  if(enabled)
-  {
-    std::map<std::string, std::vector<rs2::stream_profile> > profiles;
-    std::map<std::string, rs2::sensor> active_sensors;
-    for (const std::pair<stream_index_pair, std::vector<rs2::stream_profile>>& profile : _enabled_profiles)
-    {
-        std::string module_name = _sensors[profile.first].get_info(RS2_CAMERA_INFO_NAME);
-        ROS_INFO_STREAM("insert " << rs2_stream_to_string(profile.second.begin()->stream_type())
-          << " to " << module_name);
-        profiles[module_name].insert(profiles[module_name].begin(),
-                                        profile.second.begin(),
-                                        profile.second.end());
-        active_sensors[module_name] = _sensors[profile.first];
-    }
-
-    for (const std::pair<std::string, std::vector<rs2::stream_profile> >& sensor_profile : profiles)
-    {
-        std::string module_name = sensor_profile.first;
-        rs2::sensor sensor = active_sensors[module_name];
-        try
-        {
-            sensor.open(sensor_profile.second);
-            sensor.start(_sensors_callback[module_name]);
-
-            if (sensor.is<rs2::depth_sensor>())
-            {
-                _depth_scale_meters = sensor.as<rs2::depth_sensor>().get_depth_scale();
-            }
-        }
-        catch(const rs2::wrong_api_call_sequence_error& e)
-        {
-            msg = "Device is already ON.";
-            ROS_WARN(msg);
-            return false;
-        }
-    }
-  }
-  else
-  {
-    std::set<std::string> module_names;
-    for (const std::pair<stream_index_pair, std::vector<rs2::stream_profile>>& profile : _enabled_profiles)
-    {
-        std::string module_name = _sensors[profile.first].get_info(RS2_CAMERA_INFO_NAME);
-        std::pair< std::set<std::string>::iterator, bool> res = module_names.insert(module_name);
-        if (res.second)
-        {
-            try
-            {
-                _sensors[profile.first].stop();
-                _sensors[profile.first].close();
-            }
-            catch(const rs2::wrong_api_call_sequence_error& e)
-            {
-                msg = "Device is already OFF.";
-                ROS_WARN(msg);
-                return false;
-            }
-        }
-    }
-  }
-  return true;
-}
-
-void BaseRealSenseNode::setupErrorCallback()
-{
-    for (auto&& s : _dev.query_sensors())
-    {
-        s.set_notifications_callback([&](const rs2::notification& n)
-        {
-            std::vector<std::string> error_strings({"RT IC2 Config error",
-                                                    "Left IC2 Config error"});
-            if (n.get_severity() >= RS2_LOG_SEVERITY_ERROR)
-            {
-                ROS_WARN_STREAM("Hardware Notification:" << n.get_description() << "," << n.get_timestamp() << "," << n.get_severity() << "," << n.get_category());
-            }
-            if (error_strings.end() != find_if(error_strings.begin(), error_strings.end(), [&n] (std::string err) 
-                                        {return (n.get_description().find(err) != std::string::npos); }))
-            {
-                ROS_ERROR_STREAM("Performing Hardware Reset.");
-                _dev.hardware_reset();
-            }
-        });
-    }
-}
-
-void BaseRealSenseNode::publishTopics()
-{
-    getParameters();
-    setupDevice();
-    setupFilters();
-    registerHDRoptions();
-    registerDynamicReconfigCb();
-    setupErrorCallback();
-    enable_devices();
-    setupPublishers();
-    setupStreams();
-    SetBaseStream();
-    registerAutoExposureROIOptions();
-    publishStaticTransforms();
-    publishIntrinsics();
-    ROS_INFO_STREAM("RealSense Node Is Up!");
-}
-
-void BaseRealSenseNode::runFirstFrameInitialization(rs2_stream stream_type)
-{
-    if (_is_first_frame[stream_type])
-    {
-        ROS_DEBUG_STREAM("runFirstFrameInitialization: " << _video_functions_stack.size() << ", " << rs2_stream_to_string(stream_type));
-        _is_first_frame[stream_type] = false;
-        if (!_video_functions_stack[stream_type].empty())
-        {
-            std::thread t = std::thread([=]()
-            {
-                while (!_video_functions_stack[stream_type].empty())
-                {
-                    _video_functions_stack[stream_type].back()();
-                    _video_functions_stack[stream_type].pop_back();
-                }
-            });
-            t.detach();
-        }
-    }
-}
 bool is_checkbox(rs2::options sensor, rs2_option option)
 {
     rs2::option_range op_range = sensor.get_option_range(option);
@@ -368,7 +41,7 @@ bool is_enum_option(rs2::options sensor, rs2_option option)
 {
     static const int MAX_ENUM_OPTION_VALUES(100);
     static const float EPSILON(0.05);
-    
+
     rs2::option_range op_range = sensor.get_option_range(option);
     if (abs((op_range.step - 1)) > EPSILON || (op_range.max > MAX_ENUM_OPTION_VALUES)) return false;
     for (auto i = op_range.min; i <= op_range.max; i += op_range.step)
@@ -444,6 +117,363 @@ std::string create_graph_resource_name(const std::string &original_name)
   return fixed_name;
 }
 
+SyncedImuPublisher::SyncedImuPublisher(rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_publisher,
+                                       std::size_t waiting_list_size):
+            _publisher(imu_publisher), _pause_mode(false),
+            _waiting_list_size(waiting_list_size)
+            {}
+
+SyncedImuPublisher::~SyncedImuPublisher()
+{
+    PublishPendingMessages();
+}
+
+void SyncedImuPublisher::Publish(sensor_msgs::msg::Imu imu_msg)
+{
+    std::lock_guard<std::mutex> lock_guard(_mutex);
+    if (_pause_mode)
+    {
+        if (_pending_messages.size() >= _waiting_list_size)
+        {
+            throw std::runtime_error("SyncedImuPublisher inner list reached maximum size of " + std::to_string(_pending_messages.size()));
+        }
+        _pending_messages.push(imu_msg);
+    }
+    else
+    {
+        _publisher->publish(imu_msg);
+    }
+    return;
+}
+
+void SyncedImuPublisher::Pause()
+{
+    if (!_is_enabled) return;
+    std::lock_guard<std::mutex> lock_guard(_mutex);
+    _pause_mode = true;
+}
+
+void SyncedImuPublisher::Resume()
+{
+    std::lock_guard<std::mutex> lock_guard(_mutex);
+    PublishPendingMessages();
+    _pause_mode = false;
+}
+
+void SyncedImuPublisher::PublishPendingMessages()
+{
+    while (!_pending_messages.empty())
+    {
+        const sensor_msgs::msg::Imu &imu_msg = _pending_messages.front();
+        _publisher->publish(imu_msg);
+        _pending_messages.pop();
+    }
+}
+size_t SyncedImuPublisher::getNumSubscribers()
+{
+    if (!_publisher) return 0;
+    return _publisher->get_subscription_count();
+}
+
+static const rmw_qos_profile_t rmw_qos_profile_latched =
+{
+    RMW_QOS_POLICY_HISTORY_KEEP_LAST,
+    1,
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL,
+    RMW_QOS_DEADLINE_DEFAULT,
+    RMW_QOS_LIFESPAN_DEFAULT,
+    RMW_QOS_POLICY_LIVELINESS_SYSTEM_DEFAULT,
+    RMW_QOS_LIVELINESS_LEASE_DURATION_DEFAULT,
+    false
+};
+
+BaseRealSenseNode::BaseRealSenseNode(rclcpp::Node& node,
+                                    rs2::device dev, std::shared_ptr<Parameters> parameters) :
+    _is_running(true),
+    _base_frame_id(""),
+    _node(node),
+    _logger(rclcpp::get_logger("RealSenseCameraNode")),
+    _dev(dev),
+    _json_file_path(""),
+    _dynamic_tf_broadcaster(node),
+    _is_initialized_time_base(false),
+    _parameters(parameters)
+{
+    setNgetNodeParameter(_publish_tf, "publish_tf", PUBLISH_TF);
+    if (_publish_tf) {
+      _static_tf_broadcaster = std::make_shared<tf2_ros::StaticTransformBroadcaster>(node);
+    }
+
+    // Types for depth stream
+    _format[RS2_STREAM_DEPTH] = RS2_FORMAT_Z16;
+    _image_format[RS2_STREAM_DEPTH] = CV_16UC1;    // CVBridge type
+    _encoding[RS2_STREAM_DEPTH] = sensor_msgs::image_encodings::TYPE_16UC1; // ROS message type
+    _unit_step_size[RS2_STREAM_DEPTH] = sizeof(uint16_t); // sensor_msgs::ImagePtr row step size
+    _stream_name[RS2_STREAM_DEPTH] = "depth";
+
+    // Types for confidence stream
+    _image_format[RS2_STREAM_CONFIDENCE] = CV_8UC1;    // CVBridge type
+    _encoding[RS2_STREAM_CONFIDENCE] = sensor_msgs::image_encodings::MONO8; // ROS message type
+    _unit_step_size[RS2_STREAM_CONFIDENCE] = sizeof(uint8_t); // sensor_msgs::ImagePtr row step size
+    _stream_name[RS2_STREAM_CONFIDENCE] = "confidence";
+
+    // Infrared stream
+    _format[RS2_STREAM_INFRARED] = RS2_FORMAT_Y8;
+
+    _image_format[RS2_STREAM_INFRARED] = CV_8UC1;    // CVBridge type
+    _encoding[RS2_STREAM_INFRARED] = sensor_msgs::image_encodings::MONO8; // ROS message type
+    _unit_step_size[RS2_STREAM_INFRARED] = sizeof(uint8_t); // sensor_msgs::ImagePtr row step size
+    _stream_name[RS2_STREAM_INFRARED] = "infra";
+
+    // Types for color stream
+    _image_format[RS2_STREAM_COLOR] = CV_8UC3;    // CVBridge type
+    _encoding[RS2_STREAM_COLOR] = sensor_msgs::image_encodings::RGB8; // ROS message type
+    _unit_step_size[RS2_STREAM_COLOR] = 3; // sensor_msgs::ImagePtr row step size
+    _stream_name[RS2_STREAM_COLOR] = "color";
+    _depth_aligned_encoding[RS2_STREAM_COLOR] = sensor_msgs::image_encodings::TYPE_16UC1;
+
+    // Types for fisheye stream
+    _image_format[RS2_STREAM_FISHEYE] = CV_8UC1;    // CVBridge type
+    _encoding[RS2_STREAM_FISHEYE] = sensor_msgs::image_encodings::MONO8; // ROS message type
+    _unit_step_size[RS2_STREAM_FISHEYE] = sizeof(uint8_t); // sensor_msgs::ImagePtr row step size
+    _stream_name[RS2_STREAM_FISHEYE] = "fisheye";
+
+    // Types for Motion-Module streams
+    _stream_name[RS2_STREAM_GYRO] = "gyro";
+
+    _stream_name[RS2_STREAM_ACCEL] = "accel";
+
+    _stream_name[RS2_STREAM_POSE] = "pose";
+
+    _monitor_options = {RS2_OPTION_ASIC_TEMPERATURE, RS2_OPTION_PROJECTOR_TEMPERATURE};
+
+    try
+    {
+        publishTopics();
+        _toggle_sensors_srv = _node.create_service<std_srvs::srv::SetBool>(
+                "enable",
+                [&](std_srvs::srv::SetBool::Request::SharedPtr req, 
+                    std_srvs::srv::SetBool::Response::SharedPtr res)
+                    {toggle_sensor_callback(req, res);});
+
+        _device_info_srv = _node.create_service<realsense2_camera_msgs::srv::DeviceInfo>(
+                "device_info",
+                [&](const realsense2_camera_msgs::srv::DeviceInfo::Request::SharedPtr req,
+                          realsense2_camera_msgs::srv::DeviceInfo::Response::SharedPtr res)
+                          {getDeviceInfo(req, res);});
+
+    }
+    catch(const std::exception& e)
+    {
+        std::cerr << e.what() << '\n';
+        clean();
+        throw;
+    }
+
+}
+
+void BaseRealSenseNode::clean()
+{
+    // Kill dynamic transform thread
+    _is_running = false;
+    _cv_tf.notify_one();
+    if (_tf_t && _tf_t->joinable())
+        _tf_t->join();
+    if (_update_functions_t && _update_functions_t->joinable())
+        _update_functions_t->join();
+
+    std::set<std::string> module_names;
+    for (const std::pair<stream_index_pair, std::vector<rs2::stream_profile>>& profile : _enabled_profiles)
+    {
+        std::string module_name = _sensors[profile.first].get_info(RS2_CAMERA_INFO_NAME);
+        std::pair< std::set<std::string>::iterator, bool> res = module_names.insert(module_name);
+        if (res.second)
+        {
+            try
+            {
+                _sensors[profile.first].stop();
+            }
+            catch(const std::exception& e)
+            {
+                ROS_WARN_STREAM("Error while stopping sensor: " << e.what());
+            }
+
+            try
+            {
+                _sensors[profile.first].close();
+            }
+            catch(const std::exception& e)
+            {
+                ROS_WARN_STREAM("Error while closing sensor: " << e.what());
+            }
+        }
+    }
+    _synced_imu_publisher.reset();
+}
+BaseRealSenseNode::~BaseRealSenseNode()
+{
+    clean();
+}
+
+void BaseRealSenseNode::getDeviceInfo(const realsense2_camera_msgs::srv::DeviceInfo::Request::SharedPtr,
+                                            realsense2_camera_msgs::srv::DeviceInfo::Response::SharedPtr res)
+{
+    res->device_name = _dev.supports(RS2_CAMERA_INFO_NAME) ? create_graph_resource_name(_dev.get_info(RS2_CAMERA_INFO_NAME)) : "";
+    res->serial_number = _dev.supports(RS2_CAMERA_INFO_SERIAL_NUMBER) ? _dev.get_info(RS2_CAMERA_INFO_SERIAL_NUMBER) : "";
+    res->firmware_version = _dev.supports(RS2_CAMERA_INFO_FIRMWARE_VERSION) ? _dev.get_info(RS2_CAMERA_INFO_FIRMWARE_VERSION) : "";
+    res->usb_type_descriptor = _dev.supports(RS2_CAMERA_INFO_USB_TYPE_DESCRIPTOR) ? _dev.get_info(RS2_CAMERA_INFO_USB_TYPE_DESCRIPTOR) : "";
+    res->firmware_update_id = _dev.supports(RS2_CAMERA_INFO_FIRMWARE_UPDATE_ID) ? _dev.get_info(RS2_CAMERA_INFO_FIRMWARE_UPDATE_ID) : "";
+
+    std::stringstream sensors_names;
+    for(auto&& sensor : _dev_sensors)
+    {
+        sensors_names << create_graph_resource_name(sensor.get_info(RS2_CAMERA_INFO_NAME)) << ",";
+    }
+
+    res->sensors = sensors_names.str().substr(0, sensors_names.str().size()-1);
+}
+
+
+bool BaseRealSenseNode::toggle_sensor_callback(std_srvs::srv::SetBool::Request::SharedPtr req, std_srvs::srv::SetBool::Response::SharedPtr res)
+{
+  if (req->data) {
+    ROS_INFO_STREAM("toggling sensor : ON");
+  }
+  else {
+    ROS_INFO_STREAM("toggling sensor : OFF");
+  }
+  std::string msg;
+  res->success = toggleSensors(req->data, res->message);
+  return true;
+}
+
+bool BaseRealSenseNode::toggleSensors(bool enabled, std::string& msg)
+{
+  if(enabled)
+  {
+    std::map<std::string, std::vector<rs2::stream_profile> > profiles;
+    std::map<std::string, rs2::sensor> active_sensors;
+    for (const std::pair<stream_index_pair, std::vector<rs2::stream_profile>>& profile : _enabled_profiles)
+    {
+        std::string module_name = _sensors[profile.first].get_info(RS2_CAMERA_INFO_NAME);
+        ROS_INFO_STREAM("insert " << rs2_stream_to_string(profile.second.begin()->stream_type())
+          << " to " << module_name);
+        profiles[module_name].insert(profiles[module_name].begin(),
+                                        profile.second.begin(),
+                                        profile.second.end());
+        active_sensors[module_name] = _sensors[profile.first];
+    }
+
+    for (const std::pair<std::string, std::vector<rs2::stream_profile> >& sensor_profile : profiles)
+    {
+        std::string module_name = sensor_profile.first;
+        rs2::sensor sensor = active_sensors[module_name];
+        try
+        {
+            sensor.open(sensor_profile.second);
+            sensor.start(_sensors_callback[module_name]);
+
+            if (sensor.is<rs2::depth_sensor>())
+            {
+                _depth_scale_meters = sensor.as<rs2::depth_sensor>().get_depth_scale();
+            }
+        }
+        catch(const rs2::wrong_api_call_sequence_error& e)
+        {
+            msg = "Device is already ON.";
+            ROS_WARN(msg.c_str());
+            return false;
+        }
+    }
+  }
+  else
+  {
+    std::set<std::string> module_names;
+    for (const std::pair<stream_index_pair, std::vector<rs2::stream_profile>>& profile : _enabled_profiles)
+    {
+        std::string module_name = _sensors[profile.first].get_info(RS2_CAMERA_INFO_NAME);
+        std::pair< std::set<std::string>::iterator, bool> res = module_names.insert(module_name);
+        if (res.second)
+        {
+            try
+            {
+                _sensors[profile.first].stop();
+                _sensors[profile.first].close();
+            }
+            catch(const rs2::wrong_api_call_sequence_error& e)
+            {
+                msg = "Device is already OFF.";
+                ROS_WARN(msg.c_str());
+                return false;
+            }
+        }
+    }
+  }
+  return true;
+}
+
+void BaseRealSenseNode::setupErrorCallback()
+{
+    for (auto&& s : _dev.query_sensors())
+    {
+        s.set_notifications_callback([&](const rs2::notification& n)
+        {
+            std::vector<std::string> error_strings({"RT IC2 Config error",
+                                                    "Left IC2 Config error"});
+            if (n.get_severity() >= RS2_LOG_SEVERITY_ERROR)
+            {
+                ROS_WARN_STREAM("Hardware Notification:" << n.get_description() << "," << n.get_timestamp() << "," << n.get_severity() << "," << n.get_category());
+            }
+            if (error_strings.end() != find_if(error_strings.begin(), error_strings.end(), [&n] (std::string err)
+                                        {return (n.get_description().find(err) != std::string::npos); }))
+            {
+                ROS_ERROR_STREAM("Performing Hardware Reset.");
+                _dev.hardware_reset();
+            }
+        });
+    }
+}
+
+void BaseRealSenseNode::publishTopics()
+{
+    getParameters();
+    setupDevice();
+    setupFilters();
+    registerHDRoptions();
+    registerDynamicReconfigCb();
+    setupErrorCallback();
+    enable_devices();
+    setupPublishers();
+    setupStreams();
+    SetBaseStream();
+    registerAutoExposureROIOptions();
+    publishStaticTransforms();
+    publishIntrinsics();
+    ROS_INFO_STREAM("RealSense Node Is Up!");
+}
+
+void BaseRealSenseNode::runFirstFrameInitialization(rs2_stream stream_type)
+{
+    if (_is_first_frame[stream_type])
+    {
+        ROS_DEBUG_STREAM("runFirstFrameInitialization: " << _video_functions_stack.size() << ", " << rs2_stream_to_string(stream_type));
+        _is_first_frame[stream_type] = false;
+        if (!_video_functions_stack[stream_type].empty())
+        {
+            std::thread t = std::thread([=]()
+            {
+                while (!_video_functions_stack[stream_type].empty())
+                {
+                    _video_functions_stack[stream_type].back()();
+                    _video_functions_stack[stream_type].pop_back();
+                }
+            });
+            t.detach();
+        }
+    }
+}
+
 void BaseRealSenseNode::set_auto_exposure_roi(const std::string variable_name, rs2::sensor sensor, const rclcpp::Parameter& parameter)
 {
     int new_value(parameter.get_value<int>());
@@ -489,13 +519,13 @@ void BaseRealSenseNode::set_sensor_auto_exposure_roi(rs2::sensor sensor)
     }
 }
 
-void BaseRealSenseNode::registerAutoExposureROIOption(const std::string option_name, const int min_val, const int max_val, rs2::sensor sensor, 
+void BaseRealSenseNode::registerAutoExposureROIOption(const std::string option_name, const int min_val, const int max_val, rs2::sensor sensor,
                                                int* option_value)
 {
     // set_parameter<int>(sensor, option, module_name);
     std::string module_base_name(sensor.get_info(RS2_CAMERA_INFO_NAME));
     std::string module_name = create_graph_resource_name(module_base_name) +".auto_exposure_roi";
-    
+
     rcl_interfaces::msg::ParameterDescriptor crnt_descriptor;
     crnt_descriptor.description = option_name + " coordinate";
     rcl_interfaces::msg::IntegerRange range;
@@ -504,9 +534,9 @@ void BaseRealSenseNode::registerAutoExposureROIOption(const std::string option_n
     crnt_descriptor.integer_range.push_back(range);
     std::string variable_name(module_name + "." + option_name);
     ROS_DEBUG_STREAM("Declare ROI: INT::" << variable_name << " = " << *option_value << "[" << range.from_value << ", " << range.to_value << "]");
-    
-    _parameters->setParam(variable_name, rclcpp::ParameterValue(*option_value), [this, sensor, variable_name](const rclcpp::Parameter& parameter) 
-                { 
+
+    _parameters->setParam(variable_name, rclcpp::ParameterValue(*option_value), [this, sensor, variable_name](const rclcpp::Parameter& parameter)
+                {
                     set_auto_exposure_roi(variable_name, sensor, parameter);
                 }, crnt_descriptor);
 }
@@ -541,7 +571,7 @@ void BaseRealSenseNode::registerAutoExposureROIOptions()
 
 template<class T>
 void param_set_option(rs2::options sensor, rs2_option option, std::string option_name, const rclcpp::Parameter& parameter)
-{ 
+{
     std::cout << "set_option: " << option_name << " = " << parameter.get_value<T>() << std::endl;
     try
     {
@@ -567,7 +597,7 @@ void BaseRealSenseNode::set_parameter(rs2::options sensor, rs2_option option, co
         ROS_WARN_STREAM("Error getting sensor's option: " << option_name << " : " << e.what());
         return;
     }
-    
+
     rs2::option_range op_range = sensor.get_option_range(option);
     rcl_interfaces::msg::ParameterDescriptor crnt_descriptor;
     std::stringstream desc;
@@ -592,8 +622,8 @@ void BaseRealSenseNode::set_parameter(rs2::options sensor, rs2_option option, co
         crnt_descriptor.floating_point_range.push_back(range);
         ROS_DEBUG_STREAM("Declare: DOUBLE::" << option_name << " = " << option_value);
     }
-    _parameters->setParam(option_name, rclcpp::ParameterValue(option_value), [option, sensor, option_name](const rclcpp::Parameter& parameter) 
-                { 
+    _parameters->setParam(option_name, rclcpp::ParameterValue(option_value), [option, sensor, option_name](const rclcpp::Parameter& parameter)
+                {
                     param_set_option<T>(sensor, option, option_name, parameter);
                 }, crnt_descriptor);
 }
@@ -722,8 +752,8 @@ void BaseRealSenseNode::registerHDRoptions()
         rs2_option option = RS2_OPTION_SEQUENCE_ID;
         const std::string param_name(module_name + "." + create_graph_resource_name(rs2_option_to_string(option)));
         // Add functions to param_name - to update ros params.
-        _parameters->setParam(param_name, rclcpp::ParameterValue(0), [this, sensor](const rclcpp::Parameter& ) 
-                    { 
+        _parameters->setParam(param_name, rclcpp::ParameterValue(0), [this, sensor](const rclcpp::Parameter& )
+                    {
                         _update_functions_v.push_back([this, sensor]()
                             {set_sensor_parameter_to_ros(sensor, RS2_OPTION_EXPOSURE);});
                         _update_functions_v.push_back([this, sensor]()
@@ -768,7 +798,7 @@ void BaseRealSenseNode::monitor_update_functions()
             while (!_update_functions_v.empty())
             {
                 _update_functions_v.back()();
-                _update_functions_v.pop_back();                
+                _update_functions_v.pop_back();
             }
         }
     };
@@ -858,7 +888,6 @@ void BaseRealSenseNode::getParameters()
     setNgetNodeParameter(_filters_str, "filters", DEFAULT_FILTERS);
     _pointcloud |= (_filters_str.find("pointcloud") != std::string::npos);
 
-    setNgetNodeParameter(_publish_tf, "publish_tf", PUBLISH_TF);
     setNgetNodeParameter(_tf_publish_rate, "tf_publish_rate", TF_PUBLISH_RATE);
     setNgetNodeParameter(_sync_frames, "enable_sync", SYNC_FRAMES);
     if (_pointcloud || _align_depth || _filters_str.size() > 0)
@@ -1119,7 +1148,7 @@ void BaseRealSenseNode::setupPublishers()
     {
         if (_enable[stream])
         {
-            std::stringstream image_raw, camera_info;
+            std::stringstream image_raw, camera_info, topic_metadata;
             bool rectified_image = false;
             if (stream == DEPTH || stream == CONFIDENCE || stream == INFRA1 || stream == INFRA2)
                 rectified_image = true;
@@ -1127,10 +1156,16 @@ void BaseRealSenseNode::setupPublishers()
             std::string stream_name(STREAM_NAME(stream));
             image_raw << stream_name << "/image_" << ((rectified_image)?"rect_":"") << "raw";
             camera_info << stream_name << "/camera_info";
+            topic_metadata << stream_name << "/metadata";
 
             _image_publishers[stream] = {image_transport::create_publisher(&_node, image_raw.str(), qos_string_to_qos(_qos[stream]))};
             _info_publisher[stream] = _node.create_publisher<sensor_msgs::msg::CameraInfo>(
                   camera_info.str(),
+                  rclcpp::QoS(
+                    rclcpp::QoSInitialization::from_rmw(qos_string_to_qos(_info_qos[stream])),
+                    qos_string_to_qos(_info_qos[stream])));
+            _metadata_publishers[stream] = _node.create_publisher<realsense2_camera_msgs::msg::Metadata>(
+                  topic_metadata.str(),
                   rclcpp::QoS(
                     rclcpp::QoSInitialization::from_rmw(qos_string_to_qos(_info_qos[stream])),
                     qos_string_to_qos(_info_qos[stream])));
@@ -1183,6 +1218,13 @@ void BaseRealSenseNode::setupPublishers()
                   rclcpp::QoS(
                     rclcpp::QoSInitialization::from_rmw(qos_string_to_qos(_qos[GYRO])),
                     qos_string_to_qos(_qos[GYRO])));
+
+            auto stream(GYRO);
+            _metadata_publishers[stream] = _node.create_publisher<realsense2_camera_msgs::msg::Metadata>(
+                  "gyro/metadata",
+                  rclcpp::QoS(
+                    rclcpp::QoSInitialization::from_rmw(qos_string_to_qos(_info_qos[stream])),
+                    qos_string_to_qos(_info_qos[stream])));
         }
 
         if (_enable[ACCEL])
@@ -1192,6 +1234,13 @@ void BaseRealSenseNode::setupPublishers()
                   rclcpp::QoS(
                     rclcpp::QoSInitialization::from_rmw(qos_string_to_qos(_qos[ACCEL])),
                     qos_string_to_qos(_qos[ACCEL])));
+
+            auto stream(ACCEL);
+            _metadata_publishers[stream] = _node.create_publisher<realsense2_camera_msgs::msg::Metadata>(
+                  "accel/metadata",
+                  rclcpp::QoS(
+                    rclcpp::QoSInitialization::from_rmw(qos_string_to_qos(_info_qos[stream])),
+                    qos_string_to_qos(_info_qos[stream])));
         }
     }
     if (_enable[POSE])
@@ -1201,6 +1250,13 @@ void BaseRealSenseNode::setupPublishers()
               rclcpp::QoS(
                 rclcpp::QoSInitialization::from_rmw(qos_string_to_qos(_qos[POSE])),
                 qos_string_to_qos(_qos[POSE])));
+
+        auto stream(POSE);
+        _metadata_publishers[stream] = _node.create_publisher<realsense2_camera_msgs::msg::Metadata>(
+                "odom/metadata",
+                rclcpp::QoS(
+                rclcpp::QoSInitialization::from_rmw(qos_string_to_qos(_qos[stream])),
+                qos_string_to_qos(_qos[stream])));
     }
 
     if (_enable[FISHEYE] &&
@@ -1287,7 +1343,7 @@ void BaseRealSenseNode::enable_devices()
                     ", Stream Index: " << elem.second <<
                     ", Width: " << _width[elem] <<
                     ", Height: " << _height[elem] <<
-                    ", FPS: " << _fps[elem] << 
+                    ", FPS: " << _fps[elem] <<
                     ", Format: " << ((_format.find(elem.first) == _format.end())? "None":rs2_format_to_string(rs2_format(_format[elem.first]))));
                 if (default_profile)
                 {
@@ -1379,8 +1435,9 @@ void BaseRealSenseNode::setupFilters()
     bool use_colorizer_filter(false);
     bool use_decimation_filter(false);
     bool use_hdr_filter(false);
-    for (std::vector<std::string>::const_iterator s_iter=filters_str.begin(); s_iter!=filters_str.end(); s_iter++)
+    for (std::vector<std::string>::iterator s_iter=filters_str.begin(); s_iter!=filters_str.end(); s_iter++)
     {
+        (*s_iter).erase(std::remove_if((*s_iter).begin(), (*s_iter).end(), isspace), (*s_iter).end()); // Remove spaces
         if ((*s_iter) == "colorizer")
         {
             use_colorizer_filter = true;
@@ -1563,19 +1620,19 @@ void BaseRealSenseNode::FillImuData_LinearInterpolation(const CimuData imu_data,
 
     if ((type != ACCEL) || _imu_history.size() < 3)
         return;
-    
+
     std::deque<CimuData> gyros_data;
     CimuData accel0, accel1, crnt_imu;
 
-    while (_imu_history.size()) 
+    while (_imu_history.size())
     {
         crnt_imu = _imu_history.front();
         _imu_history.pop_front();
-        if (!accel0.is_set() && crnt_imu.m_type == ACCEL) 
+        if (!accel0.is_set() && crnt_imu.m_type == ACCEL)
         {
             accel0 = crnt_imu;
-        } 
-        else if (accel0.is_set() && crnt_imu.m_type == ACCEL) 
+        }
+        else if (accel0.is_set() && crnt_imu.m_type == ACCEL)
         {
             accel1 = crnt_imu;
             const double dt = accel1.m_time_ns - accel0.m_time_ns;
@@ -1589,7 +1646,7 @@ void BaseRealSenseNode::FillImuData_LinearInterpolation(const CimuData imu_data,
                 imu_msgs.push_back(CreateUnitedMessage(crnt_accel, crnt_gyro));
             }
             accel0 = accel1;
-        } 
+        }
         else if (accel0.is_set() && crnt_imu.m_time_ns >= accel0.m_time_ns && crnt_imu.m_type == GYRO)
         {
             gyros_data.push_back(crnt_imu);
@@ -1691,10 +1748,9 @@ void BaseRealSenseNode::imu_callback(rs2::frame frame)
                 rs2_timestamp_domain_to_string(frame.get_frame_timestamp_domain()));
 
     auto stream_index = (stream == GYRO.first)?GYRO:ACCEL;
+    rclcpp::Time t(frameSystemTimeSec(frame));
     if (0 != _imu_publishers[stream_index]->get_subscription_count())
     {
-        rclcpp::Time t(frameSystemTimeSec(frame));
-
         auto imu_msg = sensor_msgs::msg::Imu();
         ImuMessage_AddDefaultValues(imu_msg);
         imu_msg.header.frame_id = _optical_frame_id[stream_index];
@@ -1717,6 +1773,7 @@ void BaseRealSenseNode::imu_callback(rs2::frame frame)
         _imu_publishers[stream_index]->publish(imu_msg);
         ROS_DEBUG("Publish %s stream", rs2_stream_to_string(frame.get_profile().stream_type()));
     }
+    publishMetadata(frame, _optical_frame_id[stream_index]);
 }
 
 void BaseRealSenseNode::pose_callback(rs2::frame frame)
@@ -1772,13 +1829,13 @@ void BaseRealSenseNode::pose_callback(rs2::frame frame)
         v_msg.vector.x = tfv.x();
         v_msg.vector.y = tfv.y();
         v_msg.vector.z = tfv.z();
-	
+
         tfv = tf2::Vector3(-pose.angular_velocity.z, -pose.angular_velocity.x, pose.angular_velocity.y);
         tfv=tf2::quatRotate(q,tfv);
         geometry_msgs::msg::Vector3Stamped om_msg;
         om_msg.vector.x = tfv.x();
         om_msg.vector.y = tfv.y();
-        om_msg.vector.z = tfv.z();	
+        om_msg.vector.z = tfv.z();
 
         nav_msgs::msg::Odometry odom_msg;
         _seq[stream_index] += 1;
@@ -1804,12 +1861,13 @@ void BaseRealSenseNode::pose_callback(rs2::frame frame)
         _odom_publisher->publish(odom_msg);
         ROS_DEBUG("Publish %s stream", rs2_stream_to_string(frame.get_profile().stream_type()));
     }
+    publishMetadata(frame, _frame_id[POSE]);
 }
 
 void BaseRealSenseNode::frame_callback(rs2::frame frame)
 {
     _synced_imu_publisher->Pause();
-    
+
     try{
         double frame_time = frame.get_timestamp();
 
@@ -1885,7 +1943,9 @@ void BaseRealSenseNode::frame_callback(rs2::frame frame)
                         publishFrame(f, t, COLOR,
                                     _depth_aligned_image,
                                     _depth_aligned_info_publisher,
-                                    _depth_aligned_image_publishers, _depth_aligned_seq,
+                                    _depth_aligned_image_publishers, 
+                                    false,
+                                    _depth_aligned_seq,
                                     _depth_aligned_camera_info,
                                     _depth_aligned_encoding);
                         continue;
@@ -1895,7 +1955,9 @@ void BaseRealSenseNode::frame_callback(rs2::frame frame)
                                 sip,
                                 _image,
                                 _info_publisher,
-                                _image_publishers, _seq,
+                                _image_publishers, 
+                                true,
+                                _seq,
                                 _camera_info,
                                 _encoding);
             }
@@ -1906,12 +1968,14 @@ void BaseRealSenseNode::frame_callback(rs2::frame frame)
                     frame_to_send = _colorizer->process(original_depth_frame);
                 else
                     frame_to_send = original_depth_frame;
-                
+
                 publishFrame(frame_to_send, t,
                                 DEPTH,
                                 _image,
                                 _info_publisher,
-                                _image_publishers, _seq,
+                                _image_publishers,
+                                true,
+                                _seq,
                                 _camera_info,
                                 _encoding);
             }
@@ -1936,7 +2000,9 @@ void BaseRealSenseNode::frame_callback(rs2::frame frame)
                             sip,
                             _image,
                             _info_publisher,
-                            _image_publishers, _seq,
+                            _image_publishers,
+                            true,
+                            _seq,
                             _camera_info,
                             _encoding);
         }
@@ -1984,7 +2050,12 @@ rclcpp::Time BaseRealSenseNode::frameSystemTimeSec(rs2::frame frame)
     if (frame.get_frame_timestamp_domain() == RS2_TIMESTAMP_DOMAIN_HARDWARE_CLOCK)
     {
         double elapsed_camera_ns = (/*ms*/ frame.get_timestamp() - /*ms*/ _camera_time_base) * 1e6;
-        return rclcpp::Time(_ros_time_base + rclcpp::Duration(elapsed_camera_ns));
+#ifdef GALACTIC
+        rclcpp::Duration elapsed_camera(rclcpp::Duration::from_nanoseconds(elapsed_camera_ns));
+#else
+        rclcpp::Duration elapsed_camera(elapsed_camera_ns);
+#endif        
+        return rclcpp::Time(_ros_time_base + elapsed_camera);
     }
     else
     {
@@ -2245,7 +2316,7 @@ void BaseRealSenseNode::publishStaticTransforms()
                 publishDynamicTransforms();
             });
         else
-            _static_tf_broadcaster.sendTransform(_static_tf_msgs);
+            _static_tf_broadcaster->sendTransform(_static_tf_msgs);
     }
 
     // Publish Extrinsics Topics:
@@ -2299,7 +2370,7 @@ void BaseRealSenseNode::publishDynamicTransforms()
     {
         _cv_tf.wait_for(lock, std::chrono::milliseconds((int)(1000.0/_tf_publish_rate)), [&]{return (!(_is_running));});
         {
-            rclcpp::Time t = _node.now();        
+            rclcpp::Time t = _node.now();
             for(auto& msg : _static_tf_msgs)
                 msg.header.stamp = t;
             _dynamic_tf_broadcaster.sendTransform(_static_tf_msgs);
@@ -2355,8 +2426,8 @@ void BaseRealSenseNode::publishPointCloud(rs2::points pc, const rclcpp::Time& t,
     if (use_texture)
     {
         std::set<rs2_format> available_formats{ rs2_format::RS2_FORMAT_RGB8, rs2_format::RS2_FORMAT_Y8 };
-        
-        texture_frame_itr = find_if(frameset.begin(), frameset.end(), [&texture_source_id, &available_formats] (rs2::frame f) 
+
+        texture_frame_itr = find_if(frameset.begin(), frameset.end(), [&texture_source_id, &available_formats] (rs2::frame f)
                                 {return (rs2_stream(f.get_profile().stream_type()) == texture_source_id) &&
                                             (available_formats.find(f.get_profile().format()) != available_formats.end()); });
         if (texture_frame_itr == frameset.end())
@@ -2378,7 +2449,7 @@ void BaseRealSenseNode::publishPointCloud(rs2::points pc, const rclcpp::Time& t,
     rs2_intrinsics depth_intrin = pc.get_profile().as<rs2::video_stream_profile>().get_intrinsics();
 
     sensor_msgs::PointCloud2Modifier modifier(_msg_pointcloud);
-    modifier.setPointCloud2FieldsByString(1, "xyz");    
+    modifier.setPointCloud2FieldsByString(1, "xyz");
     modifier.resize(pc.size());
     if (_ordered_pc)
     {
@@ -2464,7 +2535,7 @@ void BaseRealSenseNode::publishPointCloud(rs2::points pc, const rclcpp::Time& t,
                 *iter_x = vertex->x;
                 *iter_y = vertex->y;
                 *iter_z = vertex->z;
-    
+
                 ++iter_x; ++iter_y; ++iter_z;
                 ++valid_count;
             }
@@ -2502,8 +2573,8 @@ rs2::stream_profile BaseRealSenseNode::getAProfile(const stream_index_pair& stre
 {
     const std::vector<rs2::stream_profile> profiles = _sensors[stream].get_stream_profiles();
     return *(std::find_if(profiles.begin(), profiles.end(),
-                                            [&stream] (const rs2::stream_profile& profile) { 
-                                                return ((profile.stream_type() == stream.first) && (profile.stream_index() == stream.second)); 
+                                            [&stream] (const rs2::stream_profile& profile) {
+                                                return ((profile.stream_type() == stream.first) && (profile.stream_index() == stream.second));
                                             }));
 }
 
@@ -2542,6 +2613,7 @@ void BaseRealSenseNode::publishFrame(rs2::frame f, const rclcpp::Time& t,
                                      std::map<stream_index_pair, cv::Mat>& images,
                                      const std::map<stream_index_pair, rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr>& info_publishers,
                                      const std::map<stream_index_pair, image_transport::Publisher>& image_publishers,
+                                     const bool is_publishMetadata,
                                      std::map<stream_index_pair, int>& seq,
                                      std::map<stream_index_pair, sensor_msgs::msg::CameraInfo>& camera_info,
                                      const std::map<rs2_stream, std::string>& encoding)
@@ -2595,6 +2667,52 @@ void BaseRealSenseNode::publishFrame(rs2::frame f, const rclcpp::Time& t,
 
         image_publisher.publish(img);
         ROS_DEBUG("%s stream published", rs2_stream_to_string(f.get_profile().stream_type()));
+    }
+    if (is_publishMetadata)
+    {
+        auto& cam_info = camera_info.at(stream);
+        publishMetadata(f, cam_info.header.frame_id);
+    }
+}
+
+void BaseRealSenseNode::publishMetadata(rs2::frame f, const std::string& frame_id)
+{
+    stream_index_pair stream = {f.get_profile().stream_type(), f.get_profile().stream_index()};    
+    if (_metadata_publishers.find(stream) != _metadata_publishers.end())
+    {
+        rclcpp::Time t(frameSystemTimeSec(f));    
+        auto& md_publisher = _metadata_publishers.at(stream);
+        if (0 != md_publisher->get_subscription_count())
+        {
+            realsense2_camera_msgs::msg::Metadata msg;
+            msg.header.frame_id = frame_id;
+            msg.header.stamp = t;
+            std::stringstream json_data;
+            const char* separator = ",";
+            json_data << "{";
+            // Add additional fields:
+            json_data << "\"" << "frame_number" << "\":" << f.get_frame_number();
+            json_data << separator << "\"" << "clock_domain" << "\":" << "\"" << create_graph_resource_name(rs2_timestamp_domain_to_string(f.get_frame_timestamp_domain())) << "\"";
+            json_data << separator << "\"" << "frame_timestamp" << "\":" << std::fixed << f.get_timestamp();
+
+            for (auto i = 0; i < RS2_FRAME_METADATA_COUNT; i++)
+            {
+                if (f.supports_frame_metadata((rs2_frame_metadata_value)i))
+                {
+                    rs2_frame_metadata_value mparam = (rs2_frame_metadata_value)i;
+                    std::string name = create_graph_resource_name(rs2_frame_metadata_to_string(mparam));
+                    if (RS2_FRAME_METADATA_FRAME_TIMESTAMP == i)
+                    {
+                        name = "hw_timestamp";
+                    }
+                    rs2_metadata_type val = f.get_frame_metadata(mparam);
+                    json_data << separator << "\"" << name << "\":" << val;
+                }
+            }
+            json_data << "}";
+            msg.json_data = json_data.str();
+            md_publisher->publish(msg);
+        }
     }
 }
 
